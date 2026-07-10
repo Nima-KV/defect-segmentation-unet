@@ -1,0 +1,350 @@
+from google.colab import drive
+
+# Mount Google Drive (run this once per session)
+drive.mount('/content/drive')
+
+# After mounting, your Drive appears here:
+print("Your Drive is mounted at: /content/drive/MyDrive/")
+
+from ultralytics import YOLO
+import segmentation_models_pytorch as smp
+import torch
+import cv2
+import numpy as np
+import os
+import time
+import psutil
+from tqdm import tqdm
+
+# Img directory
+
+IMAGE_FOLDER    = "/content/drive/MyDrive/Comparison/test-images"
+RESULTS_ROOT    = "/content/drive/MyDrive/Comparison/result-resnet34-GPU"
+
+YOLO_WEIGHTS    = "/content/drive/MyDrive/Comparison/my_model.pt"
+UNET_WEIGHTS    = "/content/drive/MyDrive/images-unet-train/best_defect_unet_ROI_resnet34.pth"
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
+
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Total VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3 :.1f} GB\n")
+
+os.makedirs(RESULTS_ROOT, exist_ok=True)
+
+# Load model
+
+print("Loading YOLOv8 model...")
+yolo = YOLO(YOLO_WEIGHTS)
+
+print("Loading U-Net (resnet34 vs encoder)...")
+unet = smp.Unet(
+    encoder_name="resnet34",           # ← corrected to match weights file
+    encoder_weights=None,
+    in_channels=1,
+    classes=1,
+)
+try:
+    unet.load_state_dict(torch.load(UNET_WEIGHTS, map_location=DEVICE))
+    print("U-Net weights loaded successfully.")
+except Exception as e:
+    print(f"Error loading U-Net weights: {e}")
+    raise
+
+unet.eval()
+unet.to(DEVICE)
+
+print("Models loaded.\n")
+
+# Helper function (Gen AI)
+
+def reset_gpu_peak_memory():
+    if DEVICE.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+
+def get_gpu_peak_memory_mb():
+    if DEVICE.type == "cuda":
+        return torch.cuda.max_memory_allocated() / 1024**2
+    return 0.0
+
+
+def get_process_memory_mb():
+    return psutil.Process(os.getpid()).memory_info().rss / 1024**2
+
+
+def get_gpu_utilization():
+    if DEVICE.type != "cuda":
+        return None
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        return util.gpu
+    except Exception:
+        return None
+
+
+def preprocess_for_unet(roi):
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray_resized = cv2.resize(gray, (512, 256))
+    gray_normalized = (gray_resized.astype(np.float32) / 255.0 - 0.5) / 0.5
+    tensor = torch.from_numpy(gray_normalized)[None, None].to(DEVICE)
+    return tensor
+
+
+def resize_back(mask_tensor, target_h, target_w):
+    mask_np = mask_tensor.squeeze().cpu().numpy()
+    mask_resized = cv2.resize(mask_np, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    return (mask_resized > 0.5).astype(np.uint8)
+
+#Collect images
+
+image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
+image_paths = [
+    os.path.join(IMAGE_FOLDER, f)
+    for f in os.listdir(IMAGE_FOLDER)
+    if os.path.splitext(f.lower())[1] in image_extensions
+]
+
+if not image_paths:
+    raise FileNotFoundError(f"No images found in {IMAGE_FOLDER}")
+
+print(f"Found {len(image_paths)} images.\n")
+
+# Main Process
+
+for img_path in tqdm(image_paths, desc="Processing images"):
+    image_name = os.path.basename(img_path)
+    image_name_no_ext = os.path.splitext(image_name)[0]
+
+    result_dir = os.path.join(RESULTS_ROOT, image_name_no_ext)
+    os.makedirs(result_dir, exist_ok=True)
+
+    image = cv2.imread(img_path)
+    if image is None:
+        print(f"  Failed to load: {image_name}")
+        continue
+
+    h, w = image.shape[:2]
+    original_image = image.copy()
+
+    # ─── Start hardware & time measurement ───
+    reset_gpu_peak_memory()
+    ram_start = get_process_memory_mb()
+    cpu_start = psutil.cpu_percent(interval=None)
+    gpu_start = get_gpu_utilization()
+
+    t_start = time.perf_counter()
+
+    final_mask = np.zeros((h, w), dtype=np.uint8)
+
+    # YOLO detection
+    results = yolo(image, verbose=False)[0]
+
+    # Process each detected ROI with U-Net
+    for box in results.boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+
+        if (x2 - x1) < 20 or (y2 - y1) < 20:
+            continue
+
+        roi = image[y1:y2, x1:x2]
+        roi_input = preprocess_for_unet(roi)
+
+        with torch.no_grad():
+            pred = unet(roi_input)
+            pred = torch.sigmoid(pred)
+
+        mask = resize_back(pred, y2 - y1, x2 - x1)
+        final_mask[y1:y2, x1:x2] = np.maximum(final_mask[y1:y2, x1:x2], mask)
+
+    time_total_ms = (time.perf_counter() - t_start) * 1000
+
+    ram_end = get_process_memory_mb()
+    cpu_end = psutil.cpu_percent(interval=None)
+    gpu_end = get_gpu_utilization() or gpu_start
+    peak_vram_mb = get_gpu_peak_memory_mb()
+
+    ram_delta_mb = ram_end - ram_start
+
+    # ─── Save metrics ───
+    with open(os.path.join(result_dir, "metrics.txt"), "w") as f:
+        f.write("Hybrid Method: YOLOv8 + ROI + MobileNet V2 U-Net\n")
+        f.write("═══════════════════════════════════════════════════\n\n")
+        f.write(f"Total inference time:  {time_total_ms:6.1f} ms\n")
+        if peak_vram_mb > 0:
+            f.write(f"Peak VRAM usage:       {peak_vram_mb:6.1f} MB\n")
+        else:
+            f.write("Peak VRAM usage:       (CPU mode - no VRAM)\n")
+        f.write(f"RAM increase (approx): {ram_delta_mb:6.1f} MB\n")
+        f.write(f"CPU usage (end):       {cpu_end:3.0f}%   (start: {cpu_start:3.0f}%)\n")
+        if gpu_end is not None:
+            f.write(f"GPU utilization:       {gpu_end}% \n")
+        else:
+            f.write("GPU utilization:       — (not available)\n")
+        f.write(f"\nNumber of detections:  {len(results.boxes)}\n")
+
+    # ─── Create visualizations 
+    img_boxes = original_image.copy()
+    for box in results.boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        conf = box.conf.item() if box.conf.numel() == 1 else float(box.conf[0])
+        cv2.rectangle(img_boxes, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        cv2.putText(img_boxes, f"{conf:.2f}", (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+
+    overlay_seg = original_image.copy()
+    overlay_seg[final_mask == 1] = [0, 0, 255]  # red overlay
+
+    combined = overlay_seg.copy()
+    for box in results.boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        cv2.rectangle(combined, (x1, y1), (x2, y2), (0, 255, 0), 3)
+
+    # ─── Save all results to Drive 
+    cv2.imwrite(os.path.join(result_dir, "0_original.jpg"), original_image)
+    cv2.imwrite(os.path.join(result_dir, "1_yolo_boxes.jpg"), img_boxes)
+    cv2.imwrite(os.path.join(result_dir, "2_segmentation.jpg"), overlay_seg)
+    cv2.imwrite(os.path.join(result_dir, "3_combined.jpg"), combined)
+    cv2.imwrite(os.path.join(result_dir, "4_binary_mask.png"), final_mask * 255)
+
+    # Quick console summary
+    print(f"  {image_name_no_ext:24} | {time_total_ms:6.1f} ms | VRAM {peak_vram_mb:5.0f} MB | RAMΔ {ram_delta_mb:5.0f} MB | CPU {cpu_end:3.0f}%")
+
+print("\n" + "═" * 70)
+print("Processing finished.")
+print(f"All results (images + metrics.txt) saved to: {RESULTS_ROOT}")
+print("═" * 70)
+
+
+
+import cv2
+import numpy as np
+import os
+import pandas as pd
+from pathlib import Path
+from tqdm import tqdm
+
+# ─── Configuration 
+RESULTS_ROOT = "/content/drive/MyDrive/Comparison/result-resnet34-GPU"  # adjust if needed
+
+MIN_DEFECT_AREA_PX   = 1                 # Keep EVERY detected defect
+PIXELS_TO_MM         = 0.04              # Recommended estimate for GC10-DET-like setup (40 µm/px)
+                                         # Change to your measured value when available!
+                                         # Typical range: 0.03 – 0.05 mm/px
+
+ADD_LINEAR_MM        = True              # Add bbox width/height in mm
+ADD_AREA_LABELS      = True              # Draw text on combined image (px + mm²)
+LABEL_COLOR          = (0, 255, 255)     # yellow
+LABEL_SCALE          = 0.65
+LABEL_THICKNESS      = 1
+
+OUTPUT_CSV           = os.path.join(RESULTS_ROOT, "_all_defects_sizes_mm_gc10.csv")
+SUMMARY_TXT          = os.path.join(RESULTS_ROOT, "_defect_summary_mm_gc10.txt")
+
+#  Process
+print("Processing ALL defects + mm conversion (GC10-DET scale estimate)...\n")
+
+data = []
+summary_lines = ["image_name,num_defects,total_area_px,total_area_mm2,max_area_px,max_area_mm2\n"]
+
+result_dirs = sorted([
+    d for d in Path(RESULTS_ROOT).iterdir()
+    if d.is_dir() and (d / "4_binary_mask.png").exists()
+])
+
+for folder in tqdm(result_dirs, desc="Processing images"):
+    img_name = folder.name
+    mask_path = folder / "4_binary_mask.png"
+    combined_path = folder / "3_combined.jpg"
+
+    if not mask_path.exists():
+        continue
+
+    mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        continue
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        mask, connectivity=8
+    )
+
+    img_defects = 0
+    total_area_px = 0
+    max_area_px = 0
+
+    vis = None
+    if ADD_AREA_LABELS and combined_path.exists():
+        vis = cv2.imread(str(combined_path))
+
+    for i in range(1, num_labels):
+        area_px = stats[i, cv2.CC_STAT_AREA]
+        if area_px < MIN_DEFECT_AREA_PX:
+            continue
+
+        img_defects += 1
+        total_area_px += area_px
+        max_area_px = max(max_area_px, area_px)
+
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        cx, cy = map(float, centroids[i])
+
+        area_mm2 = area_px * (PIXELS_TO_MM ** 2)
+
+        row = {
+            'image_name': img_name,
+            'defect_id': i,
+            'area_px': int(area_px),
+            'area_mm2': round(area_mm2, 3),
+            'bbox_x_px': x,
+            'bbox_y_px': y,
+            'bbox_w_px': w,
+            'bbox_h_px': h,
+            'centroid_x_px': round(cx, 1),
+            'centroid_y_px': round(cy, 1),
+        }
+
+        if ADD_LINEAR_MM:
+            row['bbox_w_mm'] = round(w * PIXELS_TO_MM, 3)
+            row['bbox_h_mm'] = round(h * PIXELS_TO_MM, 3)
+
+        data.append(row)
+
+        if vis is not None:
+            text = f"{area_px}px / {area_mm2:.2f}mm²"
+            cv2.putText(vis, text, (x, y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, LABEL_SCALE, LABEL_COLOR, LABEL_THICKNESS)
+
+    if vis is not None and img_defects > 0:
+        cv2.imwrite(str(folder / "3_combined_with_mm_gc10.jpg"), vis)
+
+    total_area_mm2 = round(total_area_px * (PIXELS_TO_MM ** 2), 2)
+    max_area_mm2 = round(max_area_px * (PIXELS_TO_MM ** 2), 2)
+    summary_lines.append(
+        f"{img_name},{img_defects},{total_area_px},{total_area_mm2},{max_area_px},{max_area_mm2}\n"
+    )
+
+#  Save 
+if data:
+    df = pd.DataFrame(data)
+    df.to_csv(OUTPUT_CSV, index=False)
+    print(f"\nSaved full defects CSV: {OUTPUT_CSV}")
+    print(f"→ Total defects: {len(df)} (no filtering applied)")
+    print(f"→ Using scale: {PIXELS_TO_MM} mm/px (estimate for GC10-DET style setup)")
+else:
+    print("No defects found.")
+
+with open(SUMMARY_TXT, "w") as f:
+    f.writelines(summary_lines)
+
+print(f"Summary (with mm): {SUMMARY_TXT}")
+print("\nTip: If you measure a real defect size (e.g. long welding line = 80 mm in reality), count its pixels → update PIXELS_TO_MM = real_mm / pixel_length")
+print("Done!")
